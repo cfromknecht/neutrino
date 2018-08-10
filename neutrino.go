@@ -1321,3 +1321,14 @@ func (s *ChainService) PeerByAddr(addr string) *ServerPeer {
 	}
 	return nil
 }
+
+// PeerByID lets the caller look up a peer ID in the service's peer
+// table, if connected to that peer address.
+func (s *ChainService) PeerByID(id int32) *ServerPeer {
+	for _, peer := range s.Peers() {
+		if peer.ID() == id {
+			return peer
+		}
+	}
+	return nil
+}
