@@ -5,7 +5,6 @@ package neutrino
 import (
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
@@ -22,7 +21,7 @@ import (
 var (
 	// QueryTimeout specifies how long to wait for a peer to answer a
 	// query.
-	QueryTimeout = time.Second * 3
+	QueryTimeout = time.Second * 30
 
 	// QueryNumRetries specifies how many times to retry sending a query to
 	// each peer before we've concluded we aren't going to get a valid
@@ -151,28 +150,6 @@ func PersistToDisk() QueryOption {
 	}
 }
 
-// queryState is an atomically updated per-query state for each query in a
-// batch.
-//
-// State transitions are:
-//
-// * queryWaitSubmit->queryWaitResponse - send query to peer
-// * queryWaitResponse->queryWaitSubmit - query timeout with no acceptable
-//   response
-// * queryWaitResponse->queryAnswered - acceptable response to query received
-type queryState uint32
-
-const (
-	// Waiting to be submitted to a peer.
-	queryWaitSubmit queryState = iota
-
-	// Submitted to a peer, waiting for reply.
-	queryWaitResponse
-
-	// Valid reply received.
-	queryAnswered
-)
-
 // We provide 3 kinds of queries:
 //
 // * queryAllPeers allows a single query to be broadcast to all peers, and
@@ -208,13 +185,7 @@ func queryChainServiceBatch(
 	// s is the ChainService to use.
 	s *ChainService,
 
-	// queryMsgs is a slice of queries for which the caller wants responses.
-	queryMsgs []wire.Message,
-
-	// checkResponse is called for every received message to see if it
-	// answers the query message. It should return true if so.
-	checkResponse func(sp *ServerPeer, query wire.Message,
-		resp wire.Message) bool,
+	handler BatchRequestHandler,
 
 	// queryQuit forces the query to end before it's complete.
 	queryQuit <-chan struct{},
@@ -227,41 +198,88 @@ func queryChainServiceBatch(
 	qo := defaultQueryOptions()
 	qo.applyQueryOptions(options...)
 
-	// Shared state between this goroutine and the per-peer goroutines.
-	queryStates := make([]uint32, len(queryMsgs))
+	scheduler := NewBatchScheduler(queryMsgs)
+
+	type spBatchResp struct {
+		sp   *ServerPeer
+		req  wire.Message
+		qid  int
+		resp wire.Message
+	}
+
+	const numInFlight = 1000
+
+	semas := make(chan struct{}, numInFlight)
+	for i := 0; i < numInFlight; i++ {
+		semas <- struct{}{}
+	}
 
 	// subscription allows us to subscribe to notifications from peers.
-	msgChan := make(chan spMsg, len(queryMsgs))
-	subQuit := make(chan struct{})
-	subscription := spMsgSubscription{
-		msgChan:  msgChan,
-		quitChan: subQuit,
-	}
-	defer close(subQuit)
+	respChan := make(chan spBatchResp, len(queryMsgs))
 
-	// peerStates and its companion mutex allow the peer goroutines to
-	// tell the main goroutine what query they're currently working on.
-	peerStates := make(map[string]wire.Message)
-	var mtxPeerStates sync.RWMutex
+	var wg sync.WaitGroup
 
-	peerGoroutine := func(sp *ServerPeer, quit <-chan struct{},
-		matchSignal <-chan struct{}) {
+	peerReceiver := func(sp *ServerPeer, msgChan <-chan spMsg,
+		timeouts map[int]*time.Timer, timeoutMtx *sync.Mutex, quit <-chan struct{}) {
+		defer wg.Done()
 
-		// Subscribe to messages from the peer.
-		sp.subscribeRecvMsg(subscription)
-		defer sp.unsubscribeRecvMsgs(subscription)
-		defer func() {
-			mtxPeerStates.Lock()
-			delete(peerStates, sp.Addr())
-			mtxPeerStates.Unlock()
-		}()
+		pid := sp.ID()
 
-		// Track the last query our peer failed to answer and skip over
-		// it for the next attempt. This helps prevent most instances
-		// of the same peer being asked for the same query every time.
-		firstUnfinished, handleQuery := 0, -1
+		for {
+			var msg spMsg
+			select {
+			case <-queryQuit:
+				return
+			case <-quit:
+				return
+			case <-s.quit:
+				return
+			case msg = <-msgChan:
+			}
 
-		for firstUnfinished < len(queryMsgs) {
+			req, qid, ok := handler.RequestForResponse(pid, msg.msg)
+			if !ok {
+				log.Debugf("Received untracked %T response from peer %d", pid)
+				continue
+			}
+
+			timeoutMtx.Lock()
+			if timeouts == nil {
+				timeoutMtx.Unlock()
+				return
+			}
+
+			timer, ok := timeouts[qid]
+			if !ok {
+				timeoutMtx.Unlock()
+				continue
+			}
+
+			if !timer.Stop() {
+				timeoutMtx.Unlock()
+				continue
+			}
+
+			delete(timeouts, qid)
+			timeoutMtx.Unlock()
+
+			if !scheduler.StatusIs(qid, queryWaitFastResponse) &&
+				!scheduler.StatusIs(qid, queryWaitSlowResponse) {
+				log.Debugf("Received LATE response from peer %d for query %d",
+					pid, qid)
+				continue
+			}
+
+			log.Debugf("Received response from peer %d for query %d",
+				pid, qid)
+
+			batchResp := spBatchResp{
+				sp:   sp,
+				req:  req,
+				qid:  qid,
+				resp: msg.msg,
+			}
+
 			select {
 			case <-queryQuit:
 				return
@@ -269,49 +287,51 @@ func queryChainServiceBatch(
 				return
 			case <-quit:
 				return
-			default:
+			case respChan <- batchResp:
 			}
+		}
+	}
 
-			handleQuery = -1
+	peerRequester := func(sp *ServerPeer, sub spMsgSubscription,
+		msgChan <-chan spMsg, quit <-chan struct{}) {
+		defer wg.Done()
 
-			for i := firstUnfinished; i < len(queryMsgs); i++ {
-				// If this query is finished and we're at
-				// firstUnfinished, update firstUnfinished.
-				if i == firstUnfinished &&
-					atomic.LoadUint32(&queryStates[i]) ==
-						uint32(queryAnswered) {
-					firstUnfinished++
-
-					log.Tracef("Query #%v already answered, "+
-						"skipping", i)
-					continue
-				}
-
-				// We check to see if the query is waiting to
-				// be handled. If so, we mark it as being
-				// handled. If not, we move to the next one.
-				if !atomic.CompareAndSwapUint32(
-					&queryStates[i],
-					uint32(queryWaitSubmit),
-					uint32(queryWaitResponse),
-				) {
-					log.Tracef("Query #%v already being "+
-						"queried for, skipping", i)
-					continue
-				}
-
-				// The query is now marked as in-process. We
-				// begin to process it.
-				handleQuery = i
-				sp.QueueMessageWithEncoding(queryMsgs[i],
-					nil, qo.encoding)
-				break
+		var timeoutMtx sync.Mutex
+		timeouts := make(map[int]*time.Timer)
+		defer func() {
+			timeoutMtx.Lock()
+			for _, timer := range timeouts {
+				timer.Stop()
 			}
+			timeouts = nil
+			timeoutMtx.Unlock()
+		}()
 
-			// Regardless of whether we have a query or not, we
-			// need a timeout.
-			timeout := time.After(qo.timeout)
-			if handleQuery == -1 {
+		// Subscribe to messages from the peer.
+		sp.subscribeRecvMsg(sub)
+		defer sp.unsubscribeRecvMsgs(sub)
+
+		wg.Add(1)
+		go peerReceiver(
+			sp,
+			msgChan,
+			timeouts,
+			&timeoutMtx,
+			quit,
+		)
+
+		pid := sp.ID()
+
+		// Track the last query our peer failed to answer and skip over
+		// it for the next attempt. This helps prevent most instances
+		// of the same peer being asked for the same query every time.
+		firstUnfinished, nextQuery := 0, -1
+
+		for firstUnfinished < len(queryMsgs) {
+			var isFast bool
+			firstUnfinished, nextQuery, isFast = scheduler.Take(pid)
+			switch {
+			case nextQuery == -1:
 				if firstUnfinished == len(queryMsgs) {
 					// We've now answered all the queries.
 					return
@@ -328,117 +348,153 @@ func queryChainServiceBatch(
 					return
 				case <-quit:
 					return
-				case <-timeout:
+				case <-time.After(time.Second):
 					if sp.Connected() {
 						continue
 					} else {
 						return
 					}
 				}
+
+			default:
 			}
 
-			// We have a query we're working on.
-			mtxPeerStates.Lock()
-			peerStates[sp.Addr()] = queryMsgs[handleQuery]
-			mtxPeerStates.Unlock()
-			select {
-			case <-queryQuit:
-				return
-			case <-s.quit:
-				return
-			case <-quit:
-				return
-			case <-timeout:
-				// We failed, so set the query state back to
-				// zero and update our lastFailed state.
-				atomic.StoreUint32(&queryStates[handleQuery],
-					uint32(queryWaitSubmit))
-				if !sp.Connected() {
-					return
+			cancel := func(qid int, fast bool) func() {
+				return func() {
+					timeoutMtx.Lock()
+					if timeouts != nil {
+						delete(timeouts, qid)
+					}
+					timeoutMtx.Unlock()
+
+					// We failed, so set the query state
+					// back to zero and update our
+					// lastFailed state.
+					scheduler.Timeout(sp.ID(), qid, fast)
+
+					if !sp.Connected() {
+						return
+					}
+
+					log.Debugf("Query for #%v failed, moving "+
+						"on: %v", qid,
+						newLogClosure(func() string {
+							return spew.Sdump(
+								queryMsgs[qid],
+							)
+						}))
 				}
-
-				log.Tracef("Query for #%v failed, moving "+
-					"on: %v", handleQuery,
-					newLogClosure(func() string {
-						return spew.Sdump(queryMsgs[handleQuery])
-					}))
-
-			case <-matchSignal:
-				// We got a match signal so we can mark this
-				// query a success.
-				atomic.StoreUint32(&queryStates[handleQuery],
-					uint32(queryAnswered))
-
-				log.Tracef("Query #%v answered, updating state",
-					handleQuery)
 			}
+
+			timeoutMtx.Lock()
+			timeouts[nextQuery] = time.AfterFunc(
+				qo.timeout, cancel(nextQuery, isFast),
+			)
+			timeoutMtx.Unlock()
+
+			tracker := BatchReqTracker{
+				PeerID:  sp.ID(),
+				QueryID: nextQuery,
+				Request: queryMsgs[nextQuery],
+			}
+
+			log.Debugf("Sending query #%v", nextQuery)
+
+			handler.RegisterRequest(tracker)
+
+			// The query is now marked as in-process. We
+			// begin to process it.
+			sp.QueueMessageWithEncoding(
+				queryMsgs[nextQuery], nil, qo.encoding,
+			)
 		}
 	}
 
+	peerSubQuits := make(map[int32]chan struct{})
+
 	// peerQuits holds per-peer quit channels so we can kill the goroutines
 	// when they disconnect.
-	peerQuits := make(map[string]chan struct{})
-
-	// matchSignals holds per-peer answer channels that get a notice that
-	// the query got a match. If it's the peer's match, the peer can
-	// mark the query a success and move on to the next query ahead of
-	// timeout.
-	matchSignals := make(map[string]chan struct{})
+	peerQuits := make(map[int32]chan struct{})
 
 	// Clean up on exit.
+	defer wg.Wait()
 	defer func() {
+		for _, peerSubQuit := range peerSubQuits {
+			close(peerSubQuit)
+		}
 		for _, quitChan := range peerQuits {
 			close(quitChan)
 		}
 	}()
 
+	ticker := time.NewTicker(qo.timeout)
+	defer ticker.Stop()
+
+	var firstUnfinished int
 	for {
 		// Update our view of peers, starting new workers for new peers
 		// and removing disconnected/banned peers.
 		for _, peer := range s.Peers() {
-			sp := peer.Addr()
-			if _, ok := peerQuits[sp]; !ok && peer.Connected() {
-				peerQuits[sp] = make(chan struct{})
-				matchSignals[sp] = make(chan struct{})
-				go peerGoroutine(
-					peer, peerQuits[sp], matchSignals[sp],
+			pid := peer.ID()
+			if _, ok := peerQuits[pid]; !ok && peer.Connected() {
+				peerSubQuits[pid] = make(chan struct{})
+				peerQuits[pid] = make(chan struct{})
+
+				msgChan := make(chan spMsg, len(queryMsgs))
+				peerSub := spMsgSubscription{
+					msgChan:  msgChan,
+					quitChan: peerSubQuits[pid],
+				}
+
+				scheduler.AddBatchPeer(pid)
+
+				wg.Add(1)
+				go peerRequester(
+					peer, peerSub, msgChan, peerQuits[pid],
 				)
 			}
 
 		}
 
-		for peer, quitChan := range peerQuits {
-			p := s.PeerByAddr(peer)
-			if p == nil || !p.Connected() {
+		for pid, quitChan := range peerQuits {
+			peer := s.PeerByID(pid)
+			if peer == nil || !peer.Connected() {
 				close(quitChan)
-				close(matchSignals[peer])
-				delete(peerQuits, peer)
-				delete(matchSignals, peer)
+				delete(peerQuits, pid)
+				close(peerSubQuits[pid])
+				delete(peerSubQuits, pid)
+				scheduler.RemoveBatchPeer(pid)
 			}
 		}
 
 		select {
-		case msg := <-msgChan:
-			mtxPeerStates.RLock()
-			curQuery := peerStates[msg.sp.Addr()]
-			mtxPeerStates.RUnlock()
-			if checkResponse(msg.sp, curQuery, msg.msg) {
-				select {
-				case <-queryQuit:
-					return
-				case <-s.quit:
-					return
-				case matchSignals[msg.sp.Addr()] <- struct{}{}:
-				}
+		case resp := <-respChan:
+			if !handler.CheckResponse(
+				resp.sp, resp.req, resp.resp,
+			) {
+				scheduler.Invalid(resp.sp.ID(), resp.qid)
+
+				log.Debugf("Query #%v check failed",
+					resp.qid)
+				continue
 			}
-		case <-time.After(qo.timeout):
+
+			// We got a match signal so we can mark this
+			// query a success.
+			scheduler.Success(resp.sp.ID(), resp.qid)
+
+			log.Debugf("Query #%v answered, updating state",
+				resp.qid)
+
+		case <-ticker.C:
 			// Check if we're done; if so, quit.
 			allDone := true
-			for i := 0; i < len(queryStates); i++ {
-				if atomic.LoadUint32(&queryStates[i]) !=
-					uint32(queryAnswered) {
+			for i := firstUnfinished; i < len(queryMsgs); i++ {
+				if !scheduler.StatusIs(i, queryAnswered) {
 					allDone = false
+					break
 				}
+				firstUnfinished++
 			}
 			if allDone {
 				return
