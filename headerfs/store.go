@@ -1,6 +1,7 @@
 package headerfs
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -85,6 +86,8 @@ type headerStore struct {
 
 	file *os.File
 
+	fbuf *bufio.Writer
+
 	*headerIndex
 }
 
@@ -124,6 +127,7 @@ func newHeaderStore(db walletdb.DB, filePath string,
 	return &headerStore{
 		filePath:    filePath,
 		file:        headerFile,
+		fbuf:        bufio.NewWriter(headerFile),
 		headerIndex: index,
 	}, nil
 }
