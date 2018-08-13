@@ -10,11 +10,11 @@ import (
 
 // appendRaw appends a new raw header to the end of the flat file.
 func (h *headerStore) appendRaw(header []byte) error {
-	if _, err := h.file.Write(header); err != nil {
+	if _, err := h.fbuf.Write(header); err != nil {
 		return err
 	}
 
-	return nil
+	return h.fbuf.Flush()
 }
 
 // readRaw reads a raw header from disk from a particular seek distance. The
