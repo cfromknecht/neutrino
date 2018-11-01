@@ -330,10 +330,11 @@ func TestBlockManagerInitialInterval(t *testing.T) {
 		// will use this to feed the blockmanager with our crafted
 		// responses.
 		bm.server.queryBatch = func(msgs []wire.Message,
-			f func(*ServerPeer, wire.Message, wire.Message) bool,
-			q <-chan struct{}, qo ...QueryOption) {
+			handler BatchResponseHandler, q <-chan struct{},
+			qo ...QueryOption) {
 
-			responses, err := generateResponses(msgs, headers)
+			requests := handler.Requests()
+			responses, err := generateResponses(requests, headers)
 			if err != nil {
 				t.Fatalf("unable to generate responses: %v",
 					err)
@@ -354,7 +355,7 @@ func TestBlockManagerInitialInterval(t *testing.T) {
 				r := *responses[index]
 
 				// Let the blockmanager handle the message.
-				if !f(nil, msgs[index], responses[index]) {
+				if !handler.CheckResponse(nil, msgs[index], &r) {
 					t.Fatalf("got response false on "+
 						"send of index %d: %v",
 						index, testDesc)
@@ -367,7 +368,7 @@ func TestBlockManagerInitialInterval(t *testing.T) {
 				}
 
 				// Otherwise resend the response we just sent.
-				if !f(nil, msgs[index], &r) {
+				if !handler.CheckResponse(nil, msgs[index], &r) {
 					t.Fatalf("got response false on "+
 						"resend of index %d: %v",
 						index, testDesc)
@@ -530,10 +531,11 @@ func TestBlockManagerInvalidInterval(t *testing.T) {
 		}
 
 		bm.server.queryBatch = func(msgs []wire.Message,
-			f func(*ServerPeer, wire.Message, wire.Message) bool,
-			q <-chan struct{}, qo ...QueryOption) {
+			handler BatchResponseHandler, q <-chan struct{},
+			qo ...QueryOption) {
 
-			responses, err := generateResponses(msgs, headers)
+			requests := handler.Requests()
+			responses, err := generateResponses(requests, headers)
 			if err != nil {
 				t.Fatalf("unable to generate responses: %v",
 					err)
@@ -568,7 +570,9 @@ func TestBlockManagerInvalidInterval(t *testing.T) {
 			// Check that the success of the callback match what we
 			// expect.
 			for i := range responses {
-				success := f(nil, msgs[i], responses[i])
+				success := handler.CheckResponse(
+					nil, requests[i], responses[i],
+				)
 				if i == test.firstInvalid {
 					if success {
 						t.Fatalf("expected interval "+
