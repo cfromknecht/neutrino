@@ -982,13 +982,15 @@ func testRandomBlocks(harness *neutrinoHarness, t *testing.T) {
 
 func TestNeutrinoSync(t *testing.T) {
 	// Set up logging.
-	logger := btclog.NewBackend(os.Stdout)
-	chainLogger := logger.Logger("CHAIN")
-	chainLogger.SetLevel(logLevel)
-	neutrino.UseLogger(chainLogger)
-	rpcLogger := logger.Logger("RPCC")
-	rpcLogger.SetLevel(logLevel)
-	rpcclient.UseLogger(rpcLogger)
+	/*
+		logger := btclog.NewBackend(os.Stdout)
+		chainLogger := logger.Logger("CHAIN")
+		chainLogger.SetLevel(logLevel)
+		neutrino.UseLogger(chainLogger)
+		rpcLogger := logger.Logger("RPCC")
+		rpcLogger.SetLevel(logLevel)
+		rpcclient.UseLogger(rpcLogger)
+	*/
 
 	// Create a btcd SimNet node and generate 800 blocks
 	h1, err := rpctest.New(
