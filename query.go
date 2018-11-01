@@ -21,7 +21,7 @@ import (
 var (
 	// QueryTimeout specifies how long to wait for a peer to answer a
 	// query.
-	QueryTimeout = time.Second * 30
+	QueryTimeout = time.Second * 3
 
 	// QueryNumRetries specifies how many times to retry sending a query to
 	// each peer before we've concluded we aren't going to get a valid
@@ -185,7 +185,7 @@ func queryChainServiceBatch(
 	// s is the ChainService to use.
 	s *ChainService,
 
-	handler BatchRequestHandler,
+	handler BatchResponseHandler,
 
 	// queryQuit forces the query to end before it's complete.
 	queryQuit <-chan struct{},
@@ -198,7 +198,10 @@ func queryChainServiceBatch(
 	qo := defaultQueryOptions()
 	qo.applyQueryOptions(options...)
 
+	queryMsgs := handler.Requests()
 	scheduler := NewBatchScheduler(queryMsgs)
+
+	fmt.Printf("num query msgs: %d\n", len(queryMsgs))
 
 	type spBatchResp struct {
 		sp   *ServerPeer
