@@ -1,13 +1,21 @@
 package neutrino
 
 import (
+	"bytes"
+	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 )
+
+type BatchResponseHandler interface {
+	Requests() []wire.Message
+	RequestForResponse(int32, wire.Message) (wire.Message, int, bool)
+	RegisterRequest(BatchReqTracker)
+	CheckResponse(*ServerPeer, wire.Message, wire.Message) bool
+}
 
 type cfHeaderReqKey struct {
 	pid  int32
@@ -28,10 +36,11 @@ type CFHeaderBatchHandler struct {
 	initialHeader *chainhash.Hash
 	checkpoints   []*chainhash.Hash
 
-	mu         sync.Mutex
 	queryMsgs  []wire.Message
 	stopHashes map[chainhash.Hash]uint32
-	trackers   map[cfHeaderReqKey]cfHeaderReqValue
+
+	mu       sync.Mutex
+	trackers map[cfHeaderReqKey]cfHeaderReqValue
 
 	// We'll also create an additional set of maps that we'll use to
 	// re-order the responses as we get them in.
@@ -61,6 +70,10 @@ func NewCFHeaderBatchHandler(
 		queryResponses:    make(map[uint32]*wire.MsgCFHeaders),
 		writeCFHeadersMsg: writer,
 	}
+}
+
+func (h *CFHeaderBatchHandler) Requests() []wire.Message {
+	return h.queryMsgs
 }
 
 func (h *CFHeaderBatchHandler) RegisterRequest(tracker BatchReqTracker) {
@@ -107,6 +120,154 @@ func (h *CFHeaderBatchHandler) RequestForResponse(
 	return trackerVal.req, trackerVal.qid, true
 }
 
+func (h *CFHeaderBatchHandler) CheckResponse(
+	sp *ServerPeer, query, resp wire.Message) bool {
+
+	r, ok := resp.(*wire.MsgCFHeaders)
+	if !ok {
+		// We are only looking for cfheaders messages.
+		return false
+	}
+
+	q, ok := query.(*wire.MsgGetCFHeaders)
+	if !ok {
+		// We sent a getcfheaders message, so that's
+		// what we should be comparing against.
+		return false
+	}
+
+	// The response doesn't match the query.
+	if q.FilterType != r.FilterType ||
+		q.StopHash != r.StopHash {
+		return false
+	}
+
+	checkPointIndex, ok := h.stopHashes[r.StopHash]
+	if !ok {
+		// We never requested a matching stop hash.
+		return false
+	}
+
+	// Use either the genesis header or the previous
+	// checkpoint index as the previous checkpoint when
+	// verifying that the filter headers in the response
+	// match up.
+	prevCheckpoint := &h.genesisHeader
+	if checkPointIndex > 0 {
+		prevCheckpoint = h.checkpoints[checkPointIndex-1]
+
+	}
+	nextCheckpoint := h.checkpoints[checkPointIndex]
+
+	// The response doesn't match the checkpoint.
+	if !verifyCheckpoint(prevCheckpoint, nextCheckpoint, r) {
+		log.Warnf("Checkpoints at index %v don't match "+
+			"response!!!", checkPointIndex)
+		return false
+	}
+
+	// At this point, the response matches the query, and
+	// the relevant checkpoint we got earlier, so we should
+	// always return true so that the peer looking for the
+	// answer to this query can move on to the next query.
+	// We still have to check that these headers are next
+	// before we write them; otherwise, we cache them if
+	// they're too far ahead, or discard them if we don't
+	// need them.
+
+	// Find the first and last height for the blocks
+	// represented by this message.
+	startHeight := checkPointIndex*wire.CFCheckptInterval + 1
+	lastHeight := (checkPointIndex + 1) * wire.CFCheckptInterval
+
+	log.Debugf("Got cfheaders from height=%v to "+
+		"height=%v, prev_hash=%v", startHeight,
+		lastHeight, r.PrevFilterHeader)
+
+	// If this is out of order but not yet written, we can
+	// verify that the checkpoints match, and then store
+	// them.
+	if startHeight > h.curHeight+1 {
+		log.Debugf("Got response for headers at "+
+			"height=%v, only at height=%v, stashing",
+			startHeight, h.curHeight)
+
+		h.queryResponses[checkPointIndex] = r
+
+		return true
+	}
+
+	// If this is out of order stuff that's already been
+	// written, we can ignore it.
+	if lastHeight <= h.curHeight {
+		log.Debugf("Received out of order reply "+
+			"end_height=%v, already written", lastHeight)
+		return true
+	}
+
+	// If this is the very first range we've requested, we
+	// may already have a portion of the headers written to
+	// disk.
+	//
+	// TODO(roasbeef): can eventually special case handle
+	// this at the top
+	if bytes.Equal(h.curHeader[:], h.initialHeader[:]) {
+		// So we'll set the prev header to our best
+		// known header, and seek within the header
+		// range a bit so we don't write any duplicate
+		// headers.
+		r.PrevFilterHeader = *h.curHeader
+		offset := h.curHeight + 1 - startHeight
+		r.FilterHashes = r.FilterHashes[offset:]
+	}
+
+	var err error
+	h.curHeader, err = h.writeCFHeadersMsg(r)
+	if err != nil {
+		panic(fmt.Sprintf("couldn't write cfheaders "+
+			"msg: %v", err))
+	}
+
+	// Then, we cycle through any cached messages, adding
+	// them to the batch and deleting them from the cache.
+	for {
+		checkPointIndex++
+
+		// We'll also update the current height of the
+		// last written set of cfheaders.
+		h.curHeight = checkPointIndex * wire.CFCheckptInterval
+
+		// If we don't yet have the next response, then
+		// we'll break out so we can wait for the peers
+		// to respond with this message.
+		r, ok := h.queryResponses[checkPointIndex]
+		if !ok {
+			break
+		}
+
+		// We have another response to write, so delete
+		// it from the cache and write it.
+		delete(h.queryResponses, checkPointIndex)
+
+		log.Debugf("Writing cfheaders at height=%v to "+
+			"next checkpoint", h.curHeight)
+
+		// As we write the set of headers to disk, we
+		// also obtain the hash of the last filter
+		// header we've written to disk so we can
+		// properly set the PrevFilterHeader field of
+		// the next message.
+		h.curHeader, err = h.writeCFHeadersMsg(r)
+		if err != nil {
+			panic(fmt.Sprintf("couldn't write "+
+				"cfheaders msg: %v", err))
+		}
+	}
+
+	return true
+
+}
+
 // queryState is an atomically updated per-query state for each query in a
 // batch.
 //
@@ -143,8 +304,6 @@ type BatchPeer struct {
 }
 
 type batchPeerState struct {
-	rtt time.Time
-
 	taken       int
 	inFlight    int
 	maxInFlight int
@@ -224,6 +383,7 @@ func (s *BatchScheduler) scheduleFastPeer(
 	}
 
 	for i := firstUnfinished; i <= initialLastUnfinished; i++ {
+		fmt.Printf("querying for status %d\n", i)
 		if i == firstUnfinished && s.StatusIs(i, queryAnswered) {
 			firstUnfinished++
 			log.Tracef("Query #%v already answered, "+
@@ -322,7 +482,9 @@ func (s *BatchScheduler) scheduleSlowPeer(
 
 func (s *BatchScheduler) AddBatchPeer(pid int32) {
 	s.peerMtx.Lock()
-	s.peers[pid] = makeBatchPeerState(initialMaxPeerInFlight)
+	if _, ok := s.peers[pid]; !ok {
+		s.peers[pid] = makeBatchPeerState(initialMaxPeerInFlight)
+	}
 	s.peerMtx.Unlock()
 }
 
