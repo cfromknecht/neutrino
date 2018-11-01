@@ -518,8 +518,8 @@ type ChainService struct {
 
 	// queryBatch will be called to distribute a batch of messages across
 	// our connected peers.
-	queryBatch func([]wire.Message, func(*ServerPeer, wire.Message,
-		wire.Message) bool, <-chan struct{}, ...QueryOption)
+	queryBatch func([]wire.Message, BatchResponseHandler,
+		<-chan struct{}, ...QueryOption)
 
 	chainParams       chaincfg.Params
 	addrManager       *addrmgr.AddrManager
@@ -618,10 +618,9 @@ func NewChainService(cfg Config) (*ChainService, error) {
 	}
 
 	// We do the same for queryBatch.
-	s.queryBatch = func(msgs []wire.Message, f func(*ServerPeer,
-		wire.Message, wire.Message) bool, q <-chan struct{},
-		qo ...QueryOption) {
-		queryChainServiceBatch(&s, msgs, f, q, qo...)
+	s.queryBatch = func(msgs []wire.Message, handler BatchResponseHandler,
+		q <-chan struct{}, qo ...QueryOption) {
+		queryChainServiceBatch(&s, handler, q, qo...)
 	}
 
 	var err error
